@@ -14,6 +14,13 @@ test -z "$CONFIG_DIR" && CONFIG_DIR="$BUILD_DIR/configs"
 export BUILD_ARCH BUILD_HOST_ARCH BUILD_ROOT BUILD_RPMS BUILD_DIR BUILD_DEBUG
 export BUILD_DIST
 
+##### openstack hacks
+# FIXME BEFORE MERGE
+OBS_OPENSTACK_KERNEL_IMAGE_ID="c97af1e7-f9f7-4c6c-9650-8f611dbd8eca"
+# * fix network setup (build instance kernel can get network, limitation by nova tools)
+# * /sbin/init is needed because kernel parameters can not submitted when using seperate kernel images
+
+
 ccache=0
 icecream=0
 shell=
@@ -52,6 +59,7 @@ ABUILD_UID=399
 ABUILD_GID=399
 
 DO_INIT=true
+DO_PREINSTALL=true
 DO_LINT=
 DO_CHECKS=true
 CLEAN_BUILD=
@@ -263,7 +271,10 @@ Known Parameters:
 
   --vm-type TYPE
               Use virtual machine instead of chroot
-              TYPE is one of xen|kvm|uml|qemu|lxc
+              TYPE is one of xen|kvm|uml|qemu|lxc|openstack
+
+  --vm-server NAME
+              openstack only: defines control server name
 
   --vm-disk FILE
               Use FILE as disk for virtual machine.
@@ -351,6 +362,10 @@ cleanup_and_exit () {
 	umount -n $BUILD_ROOT/dev/pts 2>/dev/null || true
 	test "$VM_IMAGE" = 1 && VM_IMAGE=
 	[ -n "$VM_IMAGE" ] && umount $BUILD_ROOT 2>/dev/null || true
+    fi
+    if [ "$VM_TYPE" = 'openstack' ]; then
+       openstack_volume_detach "$VM_SERVER" "$VM_VOLUME_NAME" "ONCE"
+       openstack_volume_detach "$VM_SERVER" "$VM_VOLUME_SWAP" "ONCE"
     fi
 #    echo "pid $$ exit $1"
     exit $1
@@ -733,6 +748,68 @@ mkdir_build_root()
     fi
 }
 
+openstack_volume_attach()
+{
+set -x
+    local VM_SERVER="$1"
+    local VM_VOL_NAME="$2"
+    local VM_VOL_DEV="$3"
+
+    if ! nova volume-attach "$VM_SERVER" "$VM_VOL_NAME" "$VM_VOL_DEV"; then
+	echo "ERROR: nova attach failed. $?" >&2
+	return 3
+    fi
+    while true; do
+        state=`nova volume-show "$VM_VOL_NAME" | sed -n 's,^|[ ]*status[ ]*|[ ]*\([^ ]*\).*,\1,p'`
+        [ "$state" == "in-use" ] && break
+        if [ -z "$state" ]; then
+	   echo "ERROR: unable to find state of volume $VM_VOL_NAME" >&2
+	   return 3
+        fi
+        if [ "$state" == "available" ]; then
+	   echo "WARNING: volume $VM_VOL_NAME got not attached, retrying" >&2
+           if ! nova volume-attach "$VM_SERVER" "$VM_VOL_NAME" "$VM_VOL_DEV"; then
+               echo "ERROR: nova attach failed. $?" >&2
+               return 3
+           fi
+        fi
+        sleep 3
+    done
+
+    if [ ! -e "$VM_VOL_DEV" ]; then
+        #GROSS HACK: kernel does not care about the given device name
+#        VM_VOL_DEV="/dev/"`dmesg| sed -n 's,.*\(vd.\): unknown partition tab.*,\1,p' | tail -n 1`
+        VM_VOL_DEV=`ls -1 /dev/vd? | tail -n 1`
+    fi
+set +x
+    echo "$VM_VOL_DEV"
+}
+
+openstack_volume_detach()
+{
+set -x
+    local VM_SERVER="$1"
+    local VM_VOL_NAME="$2"
+    local ONCE="$3"
+
+    # needed at all?
+    nova volume-show "$VM_VOL_NAME" | grep -q in-use || return 0
+
+    # umount seems not to be enough
+    sync
+
+    if ! nova volume-detach "$VM_SERVER" "$VM_VOL_NAME"; then
+        echo "ERROR: nova detach of $VM_VOL_NAME failed." >&2
+        [ -n "$ONCE" ] && return 3
+        return 3
+    fi
+    while nova volume-show "$VM_VOL_NAME" | grep -q availabe; do
+        sleep 3
+    done
+set +x
+    return 0
+}
+
 linux64()
 {
 	perl -e 'syscall('$PERSONALITY_SYSCALL', 0); exec(@ARGV) || die("$ARGV[0]: $!\n")' "$@"
@@ -822,6 +899,8 @@ while test -n "$1"; do
   PARAM="$1"
   ARG="$2"
   [ "$ARG" = "${ARG#-}" ] || ARG=""
+  ARG2="$3"
+  [ "$ARG2" = "${ARG2#-}" ] || ARG2=""
   shift
   case $PARAM in
     *-*=*)
@@ -922,7 +1001,7 @@ while test -n "$1"; do
 	needarg
 	VM_TYPE="$ARG"
 	case "$VM_TYPE" in
-	    xen|kvm|uml|qemu|lxc)
+	    xen|kvm|uml|qemu|lxc|openstack)
 		test -z "$VM_IMAGE" && VM_IMAGE=1
 	        ;;
 	    none|chroot) VM_TYPE='' ;;
@@ -931,6 +1010,19 @@ while test -n "$1"; do
 		cleanup_and_exit
 	    ;;
 	esac
+	shift
+      ;;
+      --vm-server)
+	needarg
+	VM_SERVER="$ARG"
+	shift
+      ;;
+      --vm-volumes)
+	needarg
+	VM_VOLUME_NAME="$ARG"
+	shift
+	needarg
+	VM_VOLUME_SWAP="$ARG2"
 	shift
       ;;
       --vm-disk)
@@ -1119,9 +1211,9 @@ fi
 
 if test "$VMDISK_MOUNT_OPTIONS" = __default; then
     if test "$VMDISK_FILESYSTEM" = reiserfs ; then
-	VMDISK_MOUNT_OPTIONS='-o data=writeback,commit=150,noatime'
+	VMDISK_MOUNT_OPTIONS='-o data=writeback,commit=150,noatime,rw'
     else
-	VMDISK_MOUNT_OPTIONS='-o data=writeback,nobarrier,commit=150,noatime'
+	VMDISK_MOUNT_OPTIONS='-o data=writeback,nobarrier,commit=150,noatime,rw'
     fi
 fi
 
@@ -1152,6 +1244,15 @@ if test -n "$KILL" ; then
 		cleanup_and_exit 1
 	    fi
 	fi
+    elif test "$VM_TYPE" = 'openstack'; then
+set -x
+	if nova show "$VM_VOLUME_NAME" >/dev/null 2>&1 ; then
+	    if ! nova delete "$VM_VOLUME_NAME" ; then
+		echo "could not kill openstack vm build $VM_VOLUME_NAME"
+		cleanup_and_exit 1
+	    fi
+	fi
+set +x
     elif test -n "$VM_TYPE"; then
 	if ! fuser -k -TERM "$VM_IMAGE"; then
 	    echo "could not kill build in $VM_IMAGE"
@@ -1176,6 +1277,36 @@ if [ "$VM_TYPE" = 'xen' -a -z "$RUNNING_IN_VM" ]; then
     elif [ -e "/boot/initrd-xen" ]; then
 	vm_initrd="/boot/initrd-xen"
     fi
+fi
+
+if [ "$VM_TYPE" = 'openstack' -a -z "$RUNNING_IN_VM" ]; then
+set -x
+    # verify settings
+    if [ -z "$OS_AUTH_URL" ]; then
+	echo "ERROR:No openstack environment set. This vm-type works only inside of an openstack VM."
+	cleanup_and_exit 3
+    fi
+    if [ -z "$OBS_OPENSTACK_KERNEL_IMAGE_ID" ]; then
+	echo "ERROR: No image refering to kernel and ramdisk is defined in OBS_OPENSTACK_KERNEL_IMAGE_ID env."
+	cleanup_and_exit 3
+    fi
+    if [ -z "$VM_VOLUME_NAME" ]; then
+	echo "ERROR: No worker root VM volume name specified."
+	cleanup_and_exit 3
+    fi
+    if [ -z "$VM_VOLUME_SWAP" ]; then
+	echo "ERROR: No worker swap VM volume name specified."
+	cleanup_and_exit 3
+    fi
+    if [ -z "$VM_SERVER" ]; then
+	echo "ERROR: No VM server nod name specified (usually this instance)."
+	cleanup_and_exit 3
+    fi
+
+    # go
+    VM_IMAGE=`openstack_volume_attach "$VM_SERVER" "$VM_VOLUME_NAME" "$VM_IMAGE"`
+    [ "${VM_IMAGE:0:5}" == "/dev/" ] || cleanup_and_exit 3
+set +x
 fi
 
 if [ "$VM_TYPE" = 'kvm' -a -z "$RUNNING_IN_VM" ]; then
@@ -1250,6 +1381,11 @@ if [ "$VM_TYPE" = 'kvm' -a -z "$RUNNING_IN_VM" ]; then
     fi
 fi
 
+if [ "$VM_TYPE" = 'openstack' ]; then
+    VM_SWAPDEV=/dev/vdb
+    qemu_rootdev=/dev/vda
+fi
+
 if [ "$VM_TYPE" = 'qemu' ]; then
     VM_SWAPDEV=/dev/sdb
     qemu_rootdev=/dev/sda
@@ -1310,6 +1446,10 @@ if test -z "$RUNNING_IN_VM" ; then
 	    xm destroy "build_$XENID" >/dev/null 2>&1
 	fi
 	if test ! -e "$VM_IMAGE"; then
+	    if [ "${VM_IMAGE:0:5}" = "/dev/" ]; then
+	      echo "Device $VM_IMAGE does not exit"
+	      cleanup_and_exit 3
+            fi
 	    echo "Creating $VM_IMAGE (${VMDISK_ROOTSIZE}M)"
 	    mkdir -p "${VM_IMAGE%/*}"
 	    dd if=/dev/zero of="$VM_IMAGE" bs=1M count=0 seek="$VMDISK_ROOTSIZE" || cleanup_and_exit 3
@@ -1318,6 +1458,10 @@ if test -z "$RUNNING_IN_VM" ; then
 	    fi
 	fi
 	if test -n "$VM_SWAP" -a ! -e "$VM_SWAP"; then
+	    if [ "${VM_SWAP:0:5}" = "/dev/" ]; then
+	      echo "Device $VM_SWAP does not exit"
+	      cleanup_and_exit 3
+            fi
 	    # setup VM_SWAP
 	    echo "Creating $VM_SWAP (${VMDISK_SWAPSIZE}M)"
 	    mkdir -p "${VM_SWAP%/*}"
@@ -1350,9 +1494,12 @@ if test -z "$RUNNING_IN_VM" ; then
 	test -w /root || become_root_or_fail
     fi
     if test -n "$VM_SWAP" ; then
+        [ "$VM_TYPE" = 'openstack' ] && VM_SWAP=`openstack_volume_attach "$VM_SERVER" "$VM_VOLUME_SWAP" "$VM_SWAP"`
+        [ "${VM_SWAP:0:5}" == "/dev/" ] || cleanup_and_exit 3
 	dd if=/dev/zero of="$VM_SWAP" bs=12 count=1 conv=notrunc 2>/dev/null
 	echo "mkswap $VM_SWAP"
 	mkswap "$VM_SWAP"
+        [ "$VM_TYPE" = 'openstack' ] && openstack_volume_detach "$VM_SERVER" "$VM_VOLUME_SWAP"
     fi
 fi
 
@@ -1505,12 +1652,20 @@ for SPECFILE in "${SPECFILES[@]}" ; do
 	rm -rf "$BUILD_ROOT/.build"
 	mkdir -p "$BUILD_ROOT/.build"
 	if test "$DO_INIT" = true ; then
-	    # do fist stage of init_buildsystem
-	    rm -f $BUILD_ROOT/.build.success
-	    set -- init_buildsystem --configdir "$CONFIG_DIR" --cachedir "$CACHE_DIR" --prepare "${definesnstuff[@]}" "${repos[@]}" $CLEAN_BUILD $USE_SYSTEM_QEMU $USEUSEDFORBUILD $RPMLIST "$MYSRCDIR/$SPECFILE" $ADDITIONAL_PACKS
-	    echo "$* ..."
-	    "$@" || cleanup_and_exit 1
-	    check_exit
+	    if test "$DO_PREINSTALL" = true ; then
+	        # do first stage of init_buildsystem
+	        rm -f $BUILD_ROOT/.build.success
+	        set -- init_buildsystem --configdir "$CONFIG_DIR" --cachedir "$CACHE_DIR" --prepare "${definesnstuff[@]}" "${repos[@]}" $CLEAN_BUILD $USE_SYSTEM_QEMU $USEUSEDFORBUILD $RPMLIST "$MYSRCDIR/$SPECFILE" $ADDITIONAL_PACKS
+	        echo "$* ..."
+	        "$@" || cleanup_and_exit 1
+	        check_exit
+
+                # store preinstall as snapshot?
+                if [ "$VM_TYPE" = 'openstack' ]; then
+set -x
+set +x
+                fi
+            fi
 	    if [ ! -w /root ]; then
 		# remove setuid bit if files belong to user to make e.g. mount work
 		find $BUILD_ROOT/{bin,sbin,usr/bin,usr/sbin} -type f -uid $UID -perm +4000 -print0 | xargs -0 --no-run-if-empty chmod -s
@@ -1584,12 +1739,6 @@ for SPECFILE in "${SPECFILES[@]}" ; do
 	umount -n $BUILD_ROOT/dev/pts 2> /dev/null || true
 	umount -n $BUILD_ROOT/mnt 2> /dev/null || true
 
-	if [ -n "$VM_IMAGE" ]; then
-	    check_exit
-	    # needs to work otherwise we have a corrupted file system
-	    umount $BUILD_ROOT || cleanup_and_exit 1
-	fi
-
 	if check_use_emulator; then
 	    if [ -x "$BUILD_DIR/initvm" -a -e "$BUILD_DIR/qemu-reg" ]; then
 		vm_init_script="/.build/initvm"
@@ -1601,6 +1750,20 @@ for SPECFILE in "${SPECFILES[@]}" ; do
 	else
 	    vm_init_script="/.build/build"
 	fi
+
+        if [ "$VM_TYPE" = 'openstack' ]; then
+set -x
+            # HACK: FIXME: we need handle this either via kernel parameters or initrd
+            ln -sf "$vm_init_script" "$BUILD_ROOT/sbin/init"
+        fi
+
+	if [ -n "$VM_IMAGE" ]; then
+	    check_exit
+	    # needs to work otherwise we have a corrupted file system
+	    umount $BUILD_ROOT || cleanup_and_exit 3
+	fi
+
+        [ "$VM_TYPE" = 'openstack' ] && openstack_volume_detach "$VM_SERVER" "$VM_VOLUME_NAME"
 
 	if [ "$VM_TYPE" = 'xen' ]; then
 		XMROOT="file:$(readlink -f $VM_IMAGE)"
@@ -1705,6 +1868,16 @@ for SPECFILE in "${SPECFILES[@]}" ; do
 		fi
 		echo "$@"
 		"$@"
+	elif [ "$VM_TYPE" = 'openstack' ]; then
+		echo "booting $VM_TYPE ..."
+set -x
+                nova boot --image $OBS_OPENSTACK_KERNEL_IMAGE_ID --flavor m1.small --block_device_mapping vda=${VM_VOLUME_NAME}::$(( $VMDISK_ROOTSIZE / 1024 )):0 --block_device_mapping vdb=${VM_VOLUME_SWAP}::1:0 --poll "build-$VM_VOLUME_NAME" || cleanup_and_exit 3
+                
+#                while [ `nova show "build-$VM_VOLUME_NAME" | sed -n -e 's,|[ ]*status[ ]*|[ ]*\([^ ]*\).*,\1,p'` == "ACTIVE" ]; do
+#                  sleep 5
+#                done
+                nova console-log "build-$VM_VOLUME_NAME"
+set +x
 	elif [ "$VM_TYPE" = 'lxc' ]; then
 		echo "booting $VM_TYPE ..."
 		LXCCONF="$BUILD_ROOT/.build.lxc.conf"
@@ -1727,6 +1900,12 @@ for SPECFILE in "${SPECFILES[@]}" ; do
 	    BUILDSTATUS=`dd if="$VM_SWAP" bs=12 count=1 2>/dev/null`
 	    case $BUILDSTATUS in
 	      BUILDSTATUS[02])
+	        if [ "$VM_TYPE" = 'openstack' ]; then
+                   VM_IMAGE=`openstack_volume_attach "$VM_SERVER" "$VM_VOLUME_NAME" "$VM_IMAGE"`
+                   [ "${VM_IMAGE:0:5}" == "/dev/" ] || cleanup_and_exit 3
+                   VM_SWAP=`openstack_volume_attach "$VM_SERVER" "$VM_VOLUME_SWAP" "$VM_SWAP"`
+                   [ "${VM_SWAP:0:5}" == "/dev/" ] || cleanup_and_exit 3
+                fi
 		mkdir -p $BUILD_ROOT/.build.packages
 		cd $BUILD_ROOT/.build.packages || cleanup_and_exit 1
 		echo "build: extracting built packages..."
@@ -1763,6 +1942,10 @@ for SPECFILE in "${SPECFILES[@]}" ; do
 			*) mkdir -p OTHER ; mv $i OTHER/ ;;
 		    esac
 		done
+	        if [ "$VM_TYPE" = 'openstack' ]; then
+                   openstack_volume_detach "$VM_SERVER" "$VM_VOLUME_NAME"
+                   openstack_volume_detach "$VM_SERVER" "$VM_VOLUME_SWAP"
+                fi
 		cleanup_and_exit ${BUILDSTATUS#BUILDSTATUS}
 		;;
 	      BUILDSTATUS*)
